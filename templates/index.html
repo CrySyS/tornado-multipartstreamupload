@@ -1,0 +1,17 @@
+<html>
+    <head>
+        <meta charset="utf-8" />
+        <title>Tornado - MultiPartStreamUpload</title>
+    </head>
+    <body>
+        <h1>
+            Upload form
+        </h1>
+        <form action="/upload?_xsrf={{ xsrf_token }}" method="post" enctype="multipart/form-data">
+            <p><input type="text" name="text" value="text default"></p>
+            <p><input type="file" name="file1"></p>
+            <p><input type="file" name="file2"></p>
+            <p><input type="submit" value="Upload"></p>
+        </form>
+    </body>
+</html>
