@@ -44,110 +44,109 @@ class MultiPartStreamHandler(tornado.web.RequestHandler):
                 if k == "boundary" and v:
                     boundary = tornado.escape.utf8(v)
                     if boundary.startswith(b'"') and boundary.endswith(b'"'):
-                       boundary = boundary[1:-1]
+                        boundary = boundary[1:-1]
                     boundary = b"--" + boundary
 
                     self.multipart_stream = MultiPartStream(boundary)
                     break
             else:
                 raise ValueError("multipart boundary not found")
-        except Exception as e:
-            tornado.log.gen_log.warning("Invalid multipart/form-data: %s", e)
-            self.send_error(400) #Bad request
+        except ValueError as e:
+            self.send_error(400, reason="Invalid multipart/form-data: %s" % e.message)
+        except KeyError as e:
+            self.send_error(400, reason="%s header field is missing" % e.message)
 
     def data_received(self, chunk):
-        if self.multipart_stream.rest_chunk:
-            chunk = self.multipart_stream.rest_chunk + chunk
-            self.multipart_stream.rest_chunk = None
+        try:
+            if self.multipart_stream.rest_chunk:
+                chunk = self.multipart_stream.rest_chunk + chunk
+                self.multipart_stream.rest_chunk = None
 
-        while True:
-            # BOUNDARY: Check the boundary
-            if self.multipart_stream.state == self.multipart_stream.BOUNDARY:
-                # When the last two bytes missing from the chunk
-                if len(chunk) < len(self.multipart_stream.boundary) + 2:
-                    self.multipart_stream.rest_chunk = chunk
-                    break
-
-                if chunk.startswith(self.multipart_stream.boundary + self.multipart_stream.CRLF):
-                    chunk = chunk[len(self.multipart_stream.boundary) + 2:]
-                    self.multipart_stream.state = self.multipart_stream.HEADER
-                    continue
-
-                # Last boundary
-                if chunk.startswith(self.multipart_stream.boundary + b'--'):
-                    self.multipart_stream.state = self.multipart_stream.END
-                    continue
-
-                tornado.log.gen_log.warning("Invalid multipart/form-data: no initial boundary found")
-                self.multipart_stream.state = self.multipart_stream.END
-                break
-
-            # HEADER: Parse Header
-            elif self.multipart_stream.state == self.multipart_stream.HEADER:
-                idx = chunk.find(self.multipart_stream.CRLF + self.multipart_stream.CRLF)
-                if idx == -1:
-                    self.multipart_stream.rest_chunk = chunk
-                    break
-                else:
-                    headers = tornado.httputil.HTTPHeaders.parse(chunk[:idx].decode("utf-8"))
-                    disp_header = headers.get("Content-Disposition", "")
-                    disposition, disp_params = tornado.httputil._parse_header(disp_header)
-                    if disposition != "form-data":
-                        tornado.log.gen_log.warning("multipart/form-data missing headers")
-                        self.multipart_stream.state = self.multipart_stream.END
-                        break
-                    if not disp_params.get("name"):
-                        tornado.log.gen_log.warning("multipart/form-data value missing name")
-                        self.multipart_stream.state = self.multipart_stream.END
+            while True:
+                # BOUNDARY: Check the boundary
+                if self.multipart_stream.state == self.multipart_stream.BOUNDARY:
+                    # When the last two bytes missing from the chunk
+                    if len(chunk) < len(self.multipart_stream.boundary) + 2:
+                        self.multipart_stream.rest_chunk = chunk
                         break
 
-                    chunk = chunk[idx + 4:]
-                    name = disp_params["name"]
-                    if disp_params.get("filename"):
-                        ctype = headers.get("Content-Type", "application/unknown")
-                        filepath = os.path.join(self.application.upload_dir, str(uuid.uuid4()))
-                        self.request.files.setdefault(name, []).append(StreamedFile(
-                            filename=disp_params["filename"], filepath=filepath, content_type=ctype))
-                        self.multipart_stream.file_handler = open(filepath, 'w')
-                        self.multipart_stream.state = self.multipart_stream.FILE_DATA
+                    if chunk.startswith(self.multipart_stream.boundary + self.multipart_stream.CRLF):
+                        chunk = chunk[len(self.multipart_stream.boundary) + 2:]
+                        self.multipart_stream.state = self.multipart_stream.HEADER
                         continue
+
+                    # Last boundary
+                    if chunk.startswith(self.multipart_stream.boundary + b'--'):
+                        self.multipart_stream.state = self.multipart_stream.END
+                        continue
+
+                    raise ValueError("no initial boundary found")
+
+                # HEADER: Parse Header
+                elif self.multipart_stream.state == self.multipart_stream.HEADER:
+                    idx = chunk.find(self.multipart_stream.CRLF + self.multipart_stream.CRLF)
+                    if idx == -1:
+                        self.multipart_stream.rest_chunk = chunk
+                        break
                     else:
-                        self.multipart_stream.data_name = name
-                        self.multipart_stream.state = self.multipart_stream.ARG_DATA
+                        headers = tornado.httputil.HTTPHeaders.parse(chunk[:idx].decode("utf-8"))
+                        disp_header = headers.get("Content-Disposition", "")
+                        disposition, disp_params = tornado.httputil._parse_header(disp_header)
+                        if disposition != "form-data":
+                            raise ValueError("missing headers")
+                        if not disp_params.get("name"):
+                            raise ValueError("name value is missing")
+
+                        chunk = chunk[idx + 4:]
+                        name = disp_params["name"]
+                        if disp_params.get("filename"):
+                            ctype = headers.get("Content-Type", "application/unknown")
+                            filepath = os.path.join(self.application.upload_dir, str(uuid.uuid4()))
+                            self.request.files.setdefault(name, []).append(StreamedFile(
+                                filename=disp_params["filename"], filepath=filepath, content_type=ctype))
+                            self.multipart_stream.file_handler = open(filepath, 'w')
+                            self.multipart_stream.state = self.multipart_stream.FILE_DATA
+                            continue
+                        else:
+                            self.multipart_stream.data_name = name
+                            self.multipart_stream.state = self.multipart_stream.ARG_DATA
+                            continue
+
+                # ARG_DATA: Load the argument value
+                elif self.multipart_stream.state == self.multipart_stream.ARG_DATA:
+                    idx = chunk.find(self.multipart_stream.CRLF + self.multipart_stream.boundary)
+                    if idx == -1:
+                        #No boundary in this chunk, memory buffer for argument value
+                        self.multipart_stream.rest_chunk = chunk
+                        break
+
+                    else:
+                        self.request.arguments.setdefault(self.multipart_stream.data_name, []).append(chunk[:idx]) # without CRLF
+                        chunk = chunk[idx + 2:]                                 # step after the CRLF
+                        self.multipart_stream.state = self.multipart_stream.BOUNDARY
                         continue
 
-            # ARG_DATA: Load the argument value
-            elif self.multipart_stream.state == self.multipart_stream.ARG_DATA:
-                idx = chunk.find(self.multipart_stream.CRLF + self.multipart_stream.boundary)
-                if idx == -1:
-                    #No boundary in this chunk, memory buffer for argument value
-                    self.multipart_stream.rest_chunk = chunk
+                # FILE_DATA: Save file chunks to hard disk
+                elif self.multipart_stream.state == self.multipart_stream.FILE_DATA:
+                    idx = chunk.find(self.multipart_stream.CRLF + self.multipart_stream.boundary)
+                    if idx == -1:
+                        #No boundary in this chunk, but the begin of the boundary is possible (< CRLF + boundary)
+                        self.multipart_stream.file_handler.write(chunk[:-1 * (len(self.multipart_stream.boundary) + 1)])
+                        self.multipart_stream.rest_chunk = chunk[-1 * (len(self.multipart_stream.boundary) + 1):]
+                        break
+                    else:
+                        self.multipart_stream.file_handler.write(chunk[:idx])   # write without CRLF
+                        self.multipart_stream.file_handler.close()
+                        chunk = chunk[idx + 2:]                                 # step after the CRLF
+                        self.multipart_stream.state = self.multipart_stream.BOUNDARY
+                        continue
+
+                #END: After the last boundary nothing happened
+                elif self.multipart_stream.state == self.multipart_stream.END:
                     break
-
-                else:
-                    self.request.arguments.setdefault(self.multipart_stream.data_name, []).append(chunk[:idx]) # without CRLF
-                    chunk = chunk[idx + 2:]                                 # step after the CRLF
-                    self.multipart_stream.state = self.multipart_stream.BOUNDARY
-                    continue
-
-            # FILE_DATA: Save file chunks to hard disk
-            elif self.multipart_stream.state == self.multipart_stream.FILE_DATA:
-                idx = chunk.find(self.multipart_stream.CRLF + self.multipart_stream.boundary)
-                if idx == -1:
-                    #No boundary in this chunk, but the begin of the boundary is possible (< CRLF + boundary)
-                    self.multipart_stream.file_handler.write(chunk[:-1 * (len(self.multipart_stream.boundary) + 1)])
-                    self.multipart_stream.rest_chunk = chunk[-1 * (len(self.multipart_stream.boundary) + 1):]
-                    break
-                else:
-                    self.multipart_stream.file_handler.write(chunk[:idx])   # write without CRLF
-                    self.multipart_stream.file_handler.close()
-                    chunk = chunk[idx + 2:]                                 # step after the CRLF
-                    self.multipart_stream.state = self.multipart_stream.BOUNDARY
-                    continue
-
-            #END: After the last boundary nothing happened
-            elif self.multipart_stream.state == self.multipart_stream.END:
-                break
+        except ValueError as e:
+            self.send_error(400, reason="Invalid multipart/form-data: %s" % e.message)
+            self.multipart_stream.state = self.multipart_stream.END
 
     def post(self):
         self.write("success")
